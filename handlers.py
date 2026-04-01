@@ -7,8 +7,11 @@ import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ContextTypes
 
-from database import get_user, create_user, update_max, advance_day, log_workout, get_stats
-from programs import generate_cycle, format_workout, format_cycle_plan, calculate_progress, get_motivation
+from database import (
+    get_user, create_user, update_max, reset_cycle,
+    advance_day, log_workout, get_stats, get_completed_days_this_cycle
+)
+from programs import generate_cycle, format_cycle_plan, calculate_progress, get_motivation
 
 
 # ──────────────────────── Главная клавиатура ──────────────────
@@ -16,7 +19,7 @@ from programs import generate_cycle, format_workout, format_cycle_plan, calculat
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("💪 Тренировка"), KeyboardButton("📋 План")],
-        [KeyboardButton("📊 Прогресс"),   KeyboardButton("❓ Помощь")],
+        [KeyboardButton("📊 Прогресс"),   KeyboardButton("⚙️ Настройки")],
     ],
     resize_keyboard=True,
 )
@@ -47,6 +50,29 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["waiting_for_max"] = True
 
 
+# ─────────────────────── Настройки ────────────────────────────
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = await get_user(user_id)
+    if not user:
+        await update.message.reply_text("Сначала запусти /start.")
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Изменить максимум", callback_data="settings_setmax")],
+        [InlineKeyboardButton("🔄 Сбросить цикл", callback_data="settings_reset")],
+    ])
+
+    await update.message.reply_text(
+        f"⚙️ *Настройки*\n\n"
+        f"Текущий максимум: *{user['current_max']}* подтягиваний\n"
+        f"День цикла: *{user['cycle_day']}*",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
 # ─────────────────────── Ввод текста ──────────────────────────
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -62,8 +88,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "📊 Прогресс":
         await cmd_progress(update, context)
         return
-    if text == "❓ Помощь":
-        await cmd_help(update, context)
+    if text == "⚙️ Настройки":
+        await cmd_settings(update, context)
         return
 
     # Ввод начального максимума
@@ -81,6 +107,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📈 Прогресс к цели 100: *{calculate_progress(max_reps)}%*\n\n"
             f"{get_motivation(max_reps)}\n\n"
             f"{format_cycle_plan(workouts)}",
+            parse_mode="Markdown",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    # Ввод нового максимума вручную через /setmax
+    if context.user_data.get("waiting_for_setmax"):
+        if not text.isdigit() or int(text) < 1:
+            await update.message.reply_text("❗ Введи число больше 0", parse_mode="Markdown")
+            return
+        new_max = int(text)
+        old_max = context.user_data.pop("old_max_setmax", 0)
+        context.user_data.pop("waiting_for_setmax", None)
+        await update_max(user_id, new_max)
+        workouts = generate_cycle(new_max)
+        diff = new_max - old_max
+        diff_str = f"+{diff}" if diff > 0 else str(diff)
+        await update.message.reply_text(
+            f"✅ *Максимум обновлён!*\n\n"
+            f"Было: *{old_max}* → Стало: *{new_max}* ({diff_str})\n\n"
+            f"Цикл сброшен. Новый план:\n\n{format_cycle_plan(workouts)}",
             parse_mode="Markdown",
             reply_markup=MAIN_KEYBOARD,
         )
@@ -115,7 +162,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ───────────────────── Показать подход ────────────────────────
 
 async def show_set(update_or_query, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
-    """Показывает текущий подход с кнопками +/- и Готово."""
     state = context.user_data.get("workout_state")
     if not state:
         return
@@ -129,7 +175,6 @@ async def show_set(update_or_query, context: ContextTypes.DEFAULT_TYPE, edit: bo
     while len(actual) <= idx:
         actual.append(sets[idx])
     current_reps = actual[idx]
-
     done_so_far = sum(actual[:idx])
 
     text = (
@@ -207,7 +252,7 @@ async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"*День {cycle_day} из 3 — {day_label}*\n\n"
         f"План: `{'  '.join(str(s) for s in workout.sets)}`\n"
         f"Итого: *{workout.total}* подтягиваний\n"
-        f"Отдых между подходами: *{workout.rest_seconds // 60:02d}:{workout.rest_seconds % 60:02d}*\n\n"
+        f"Отдых: *{workout.rest_seconds // 60:02d}:{workout.rest_seconds % 60:02d}*\n\n"
         f"Начинаем! 👇",
         parse_mode="Markdown",
         reply_markup=MAIN_KEYBOARD,
@@ -215,7 +260,7 @@ async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_set(update, context)
 
 
-# ───────────────────── Колбэки подходов ───────────────────────
+# ───────────────────── Колбэки ────────────────────────────────
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -223,9 +268,51 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
 
+    # ── Настройки ──
+    if data == "settings_setmax":
+        user = await get_user(user_id)
+        context.user_data["waiting_for_setmax"] = True
+        context.user_data["old_max_setmax"] = user["current_max"] if user else 0
+        await query.edit_message_text(
+            f"✏️ *Изменить максимум*\n\n"
+            f"Текущий максимум: *{user['current_max']}*\n\n"
+            f"Введи новое число:",
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "settings_reset":
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Да, сбросить", callback_data="settings_reset_confirm"),
+                InlineKeyboardButton("❌ Отмена", callback_data="settings_reset_cancel"),
+            ]
+        ])
+        await query.edit_message_text(
+            "🔄 *Сбросить цикл?*\n\n"
+            "Цикл начнётся заново с Дня 1.\n"
+            "Максимум и история сохранятся.",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+        return
+
+    if data == "settings_reset_confirm":
+        await reset_cycle(user_id)
+        await query.edit_message_text(
+            "✅ *Цикл сброшен!*\n\n"
+            "Начинаем с Дня 1. Нажми *💪 Тренировка*.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "settings_reset_cancel":
+        await query.edit_message_text("Отмена. Ничего не изменилось.")
+        return
+
+    # ── Подходы ──
     state = context.user_data.get("workout_state")
 
-    # ── +/- повторений ──
     if data in ("set_plus", "set_minus", "set_noop"):
         if not state:
             await query.edit_message_text("❗ Начни тренировку через 💪 Тренировка")
@@ -242,7 +329,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_set(query, context, edit=True)
         return
 
-    # ── Подход выполнен ──
     if data == "set_done":
         if not state:
             await query.edit_message_text("❗ Начни тренировку через 💪 Тренировка")
@@ -257,7 +343,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         done_reps = state["actual"][idx]
 
-        # Последний подход — тренировка завершена
         if idx + 1 >= total_sets:
             actual_list = state["actual"]
             actual_json = json.dumps(actual_list)
@@ -272,11 +357,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("workout_state", None)
 
             sets_str = "  ".join(str(r) for r in actual_list)
-            if cycle_day == 3:
-                next_msg = "Следующий шаг — отдых, затем *Тест максимума* 🏆"
-            else:
-                next_msg = f"Следующий шаг — отдых, затем *День {cycle_day + 1}*"
-
+            next_msg = "Следующий шаг — отдых, затем *Тест максимума* 🏆" if cycle_day == 3 else f"Следующий шаг — отдых, затем *День {cycle_day + 1}*"
             status = "✅ Выполнено!" if completed else "💪 Сделал что смог!"
 
             await query.edit_message_text(
@@ -288,48 +369,36 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Не последний подход — показываем сообщение об отдыхе
+        # Таймер отдыха
         rest = state["rest_seconds"]
         state["set_index"] = idx + 1
         while len(state["actual"]) <= idx + 1:
             state["actual"].append(sets[idx + 1])
 
-        mins = rest // 60
-        secs = rest % 60
-
-        # Редактируем сообщение — показываем что идёт отдых
         await query.edit_message_text(
             f"✅ Подход {idx + 1} выполнен: *{done_reps}* повторений\n\n"
-            f"⏱ Отдых *{mins:02d}:{secs:02d}*...\n\n"
-            f"Следующий подход {idx + 2} из {total_sets} → план *{sets[idx + 1]}*\n\n"
+            f"⏱ Отдых *{rest // 60:02d}:{rest % 60:02d}*...\n\n"
             f"_Жди уведомления когда время выйдет_",
             parse_mode="Markdown",
         )
 
-        # Ждём в фоне и отправляем уведомление
         chat_id = query.message.chat_id
         bot = context.bot
-
         await asyncio.sleep(rest)
 
-        # Проверяем что пользователь не прервал тренировку
         if not context.user_data.get("workout_state"):
             return
 
-        # Уведомление — время вышло
         await bot.send_message(
             chat_id=chat_id,
             text=f"🔔 *Отдых закончился!*\n\nПодход {idx + 2} из {total_sets} → план *{sets[idx + 1]}*",
             parse_mode="Markdown",
         )
-
-        # Показываем следующий подход новым сообщением
         await show_set_by_chat(bot, chat_id, context, idx + 1, sets, total_sets)
         return
 
 
-async def show_set_by_chat(bot, chat_id: int, context: ContextTypes.DEFAULT_TYPE, idx: int, sets: list, total_sets: int):
-    """Отправляет новое сообщение с подходом после таймера."""
+async def show_set_by_chat(bot, chat_id, context, idx, sets, total_sets):
     state = context.user_data.get("workout_state")
     if not state:
         return
@@ -360,6 +429,53 @@ async def show_set_by_chat(bot, chat_id: int, context: ContextTypes.DEFAULT_TYPE
     await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=keyboard)
 
 
+# ─────────────────────────── /plan ────────────────────────────
+
+async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = await get_user(user_id)
+    if not user:
+        await update.message.reply_text("Сначала запусти /start.", reply_markup=MAIN_KEYBOARD)
+        return
+
+    workouts = generate_cycle(user["current_max"])
+    completed_days = await get_completed_days_this_cycle(user_id)
+    current_day = user["cycle_day"]
+
+    lines = [f"📋 *План цикла* (макс: {user['current_max']})\n"]
+    for w in workouts:
+        sets_str = "  ".join(str(s) for s in w.sets)
+        mins = w.rest_seconds // 60
+        secs = w.rest_seconds % 60
+        rest_str = f"{mins:02d}:{secs:02d}"
+
+        if w.day in completed_days:
+            status = "✅"
+        elif w.day == current_day and not user["is_rest_day"]:
+            status = "▶️"
+        else:
+            status = "⬜"
+
+        lines.append(f"{status} День {w.day}: `{sets_str}` — отдых {rest_str}")
+
+    # Тест
+    if current_day == 4 and not user["is_rest_day"]:
+        test_status = "▶️"
+    elif len(completed_days) == 3:
+        test_status = "⬜"
+    else:
+        test_status = "⬜"
+    lines.append(f"{test_status} Тест максимума 🏆")
+
+    lines.append("\n_После дня 3 → день отдыха → Тест максимума_")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
 # ─────────────────────────── /progress ────────────────────────
 
 async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -379,13 +495,11 @@ async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if stats["week_workouts"] > 0:
         week_pct = round((stats["week_done"] or 0) / stats["week_workouts"] * 100)
 
-    # Динамика максимума
     max_history = stats.get("max_history", [])
-    if max_history:
-        history_str = " → ".join(str(m) for m in max_history)
+    history_line = ""
+    if len(max_history) > 1:
+        history_str = " → ".join(str(m) for m in max_history[-6:])
         history_line = f"  • Динамика: *{history_str}*\n"
-    else:
-        history_line = ""
 
     await update.message.reply_text(
         f"📊 *Статистика*\n\n"
@@ -407,32 +521,33 @@ async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ─────────────────────────── /plan ────────────────────────────
-
-async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = await get_user(user_id)
-    if not user:
-        await update.message.reply_text("Сначала запусти /start.", reply_markup=MAIN_KEYBOARD)
-        return
-    workouts = generate_cycle(user["current_max"])
-    await update.message.reply_text(
-        f"Текущий максимум: *{user['current_max']}*\n\n{format_cycle_plan(workouts)}",
-        parse_mode="Markdown",
-        reply_markup=MAIN_KEYBOARD,
-    )
-
-
 # ─────────────────────────── /help ────────────────────────────
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *Команды:*\n\n"
         "💪 *Тренировка* — начать тренировку дня\n"
-        "📋 *План* — план текущего цикла\n"
-        "📊 *Прогресс* — статистика за неделю\n"
-        "❓ *Помощь* — этот список\n\n"
-        "/start — перезапуск",
+        "📋 *План* — план цикла с галочками\n"
+        "📊 *Прогресс* — статистика\n"
+        "⚙️ *Настройки* — изменить максимум / сбросить цикл\n\n"
+        "/start — перезапуск\n"
+        "/setmax — быстро изменить максимум",
         parse_mode="Markdown",
         reply_markup=MAIN_KEYBOARD,
+    )
+
+
+# ─────────────────────────── /setmax ──────────────────────────
+
+async def cmd_setmax(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = await get_user(user_id)
+    if not user:
+        await update.message.reply_text("Сначала запусти /start.")
+        return
+    context.user_data["waiting_for_setmax"] = True
+    context.user_data["old_max_setmax"] = user["current_max"]
+    await update.message.reply_text(
+        f"✏️ Текущий максимум: *{user['current_max']}*\n\nВведи новое число:",
+        parse_mode="Markdown",
     )

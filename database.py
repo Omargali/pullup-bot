@@ -34,7 +34,6 @@ async def init_db():
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
         """)
-        # История максимумов — записывается после каждого теста
         await db.execute("""
             CREATE TABLE IF NOT EXISTS max_history (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,7 +60,6 @@ async def create_user(user_id: int, username: str, current_max: int):
             "INSERT OR IGNORE INTO users (user_id, username, current_max) VALUES (?, ?, ?)",
             (user_id, username or "", current_max),
         )
-        # Записываем начальный максимум в историю
         await db.execute(
             "INSERT INTO max_history (user_id, max_reps) VALUES (?, ?)",
             (user_id, current_max),
@@ -70,15 +68,25 @@ async def create_user(user_id: int, username: str, current_max: int):
 
 
 async def update_max(user_id: int, new_max: int):
+    """Обновляет максимум и сбрасывает цикл."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE users SET current_max = ?, cycle_day = 1, is_rest_day = 0 WHERE user_id = ?",
             (new_max, user_id),
         )
-        # Записываем новый максимум в историю
         await db.execute(
             "INSERT INTO max_history (user_id, max_reps) VALUES (?, ?)",
             (user_id, new_max),
+        )
+        await db.commit()
+
+
+async def reset_cycle(user_id: int):
+    """Сбрасывает только цикл, максимум остаётся."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET cycle_day = 1, is_rest_day = 0 WHERE user_id = ?",
+            (user_id,),
         )
         await db.commit()
 
@@ -113,6 +121,21 @@ async def log_workout(user_id: int, cycle_day: int, planned: str, actual: str, c
         await db.commit()
 
 
+async def get_completed_days_this_cycle(user_id: int) -> list:
+    """Возвращает список выполненных дней в текущем цикле (1, 2, 3)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        # Берём последние записи — дни текущего цикла
+        # Цикл сбрасывается при update_max/reset_cycle, поэтому берём записи после последнего сброса
+        async with db.execute("""
+            SELECT cycle_day FROM workout_log
+            WHERE user_id = ? AND cycle_day IN (1, 2, 3) AND completed = 1
+            ORDER BY logged_at DESC LIMIT 3
+        """, (user_id,)) as cursor:
+            rows = await cursor.fetchall()
+        return [r["cycle_day"] for r in rows]
+
+
 async def get_stats(user_id: int) -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -124,7 +147,6 @@ async def get_stats(user_id: int) -> dict:
             if not row:
                 return {}
 
-        # Статистика за эту неделю
         async with db.execute("""
             SELECT COUNT(*) as total, SUM(completed) as done
             FROM workout_log
@@ -132,7 +154,6 @@ async def get_stats(user_id: int) -> dict:
         """, (user_id,)) as cursor:
             week = await cursor.fetchone()
 
-        # Объём за неделю
         async with db.execute("""
             SELECT actual FROM workout_log
             WHERE user_id = ? AND actual IS NOT NULL AND actual != ''
@@ -147,7 +168,6 @@ async def get_stats(user_id: int) -> dict:
             except Exception:
                 pass
 
-        # Процент выполнения за всё время
         async with db.execute("""
             SELECT COUNT(*) as total, SUM(completed) as done
             FROM workout_log WHERE user_id = ?
@@ -158,11 +178,9 @@ async def get_stats(user_id: int) -> dict:
         if all_time["total"] and all_time["total"] > 0:
             completion_pct = round((all_time["done"] or 0) / all_time["total"] * 100)
 
-        # Динамика максимума — последние 6 записей
         async with db.execute("""
             SELECT max_reps FROM max_history
-            WHERE user_id = ?
-            ORDER BY recorded_at ASC
+            WHERE user_id = ? ORDER BY recorded_at ASC
         """, (user_id,)) as cursor:
             history_rows = await cursor.fetchall()
 

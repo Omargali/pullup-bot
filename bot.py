@@ -18,6 +18,7 @@ from telegram.ext import (
 
 from database import init_db
 from handlers import (
+    cmd_setmax,
     cmd_start,
     cmd_workout,
     cmd_progress,
@@ -48,6 +49,7 @@ def main():
     app.add_handler(CommandHandler("progress", cmd_progress))
     app.add_handler(CommandHandler("plan", cmd_plan))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("setmax", cmd_setmax))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
