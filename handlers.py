@@ -330,6 +330,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Отмена. Ничего не изменилось.")
         return
 
+    # ── Пропустить отдых ──
+    if data == "skip_rest":
+        state = context.user_data.get("workout_state")
+        if state:
+            state["timer_skip"] = True
+            # Убираем кнопку с сообщения
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        return
+
     # ── Подходы ──
     state = context.user_data.get("workout_state")
 
@@ -399,30 +411,74 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Таймер отдыха
+        # Таймер отдыха с обратным отсчётом
         rest = state["rest_seconds"]
         state["set_index"] = idx + 1
-        state["processing"] = False  # сбрасываем флаг для следующего подхода
+        state["processing"] = False
+        state["timer_skip"] = False  # флаг пропуска таймера
         while len(state["actual"]) <= idx + 1:
             state["actual"].append(sets[idx + 1])
 
-        await query.edit_message_text(
-            f"✅ Подход {idx + 1} выполнен: *{done_reps}* повторений\n\n"
-            f"⏱ Отдых *{rest // 60:02d}:{rest % 60:02d}*...\n\n"
-            f"_Жди уведомления когда время выйдет_",
+        chat_id = query.message.chat_id
+        msg_id = query.message.message_id
+        bot = context.bot
+
+        def skip_keyboard():
+            return InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭ Пропустить отдых", callback_data="skip_rest")]
+            ])
+
+        # Первое сообщение с таймером
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=(
+                f"✅ Подход {idx + 1} выполнен: *{done_reps}* повторений\n\n"
+                f"⏱ Отдых *{rest // 60:02d}:{rest % 60:02d}*"
+            ),
             parse_mode="Markdown",
+            reply_markup=skip_keyboard(),
         )
 
-        chat_id = query.message.chat_id
-        bot = context.bot
-        await asyncio.sleep(rest)
+        # Обратный отсчёт каждые 5 секунд
+        elapsed = 0
+        interval = 5
+        while elapsed < rest:
+            await asyncio.sleep(interval)
+            elapsed += interval
+
+            # Если нажали "Пропустить" — выходим из таймера
+            if not context.user_data.get("workout_state"):
+                return
+            if context.user_data.get("workout_state", {}).get("timer_skip"):
+                context.user_data["workout_state"]["timer_skip"] = False
+                break
+
+            remaining = max(0, rest - elapsed)
+            mins = remaining // 60
+            secs = remaining % 60
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=(
+                        f"✅ Подход {idx + 1} выполнен: *{done_reps}* повторений\n\n"
+                        f"⏱ Отдых *{mins:02d}:{secs:02d}*"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=skip_keyboard(),
+                )
+            except Exception:
+                break
 
         if not context.user_data.get("workout_state"):
             return
 
-        await bot.send_message(
+        # Таймер закончился — показываем следующий подход
+        await bot.edit_message_text(
             chat_id=chat_id,
-            text=f"🔔 *Отдых закончился!*\n\nПодход {idx + 2} из {total_sets} → план *{sets[idx + 1]}*",
+            message_id=msg_id,
+            text=f"✅ Подход {idx + 1} выполнен: *{done_reps}* повторений\n\n🔔 *Отдых закончился!*",
             parse_mode="Markdown",
         )
         await show_set_by_chat(bot, chat_id, context, idx + 1, sets, total_sets)
@@ -483,14 +539,14 @@ async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif w.day == current_day and not user["is_rest_day"]:
             status = "▶️"
         else:
-            status = "❌"
+            status = "⬜"
 
         lines.append(f"{status} День {w.day}: `{sets_str}` — отдых {rest_str}")
 
     if current_day == 4 and not user["is_rest_day"]:
         test_status = "▶️"
     else:
-        test_status = "❌"
+        test_status = "⬜"
     lines.append(f"{test_status} Тест максимума 🏆")
     lines.append("\n_После дня 3 → день отдыха → Тест максимума_")
 
