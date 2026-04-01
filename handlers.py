@@ -330,13 +330,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Отмена. Ничего не изменилось.")
         return
 
-    # ── Пропустить отдых ──
-    if data == "skip_rest":
-        state = context.user_data.get("workout_state")
-        if state and "skip_event" in state:
-            state["skip_event"].set()  # мгновенно прерывает asyncio.wait_for
-        return
-
     # ── Подходы ──
     state = context.user_data.get("workout_state")
 
@@ -410,22 +403,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rest = state["rest_seconds"]
         state["set_index"] = idx + 1
         state["processing"] = False
-
-        # asyncio.Event — мгновенно прерывает таймер при нажатии "Пропустить"
-        skip_event = asyncio.Event()
-        state["skip_event"] = skip_event
-
         while len(state["actual"]) <= idx + 1:
             state["actual"].append(sets[idx + 1])
 
         chat_id = query.message.chat_id
         msg_id = query.message.message_id
         bot = context.bot
-
-        def skip_keyboard():
-            return InlineKeyboardMarkup([
-                [InlineKeyboardButton("⏭ Пропустить отдых", callback_data="skip_rest")]
-            ])
 
         # Первое сообщение с таймером
         await bot.edit_message_text(
@@ -436,43 +419,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⏱ Отдых *{rest // 60:02d}:{rest % 60:02d}*"
             ),
             parse_mode="Markdown",
-            reply_markup=skip_keyboard(),
         )
 
-        # Обратный отсчёт — каждую секунду ждём либо таймер либо skip_event
-        for remaining in range(rest - 1, -1, -1):
-            try:
-                # Ждём 1 секунду или пока не нажмут "Пропустить"
-                await asyncio.wait_for(asyncio.shield(skip_event.wait()), timeout=1.0)
-                break  # skip_event сработал — выходим из цикла
-            except asyncio.TimeoutError:
-                pass  # прошла 1 секунда, продолжаем
+        # Обратный отсчёт — обновляем каждые 5 секунд
+        for remaining in range(rest - 5, -1, -5):
+            await asyncio.sleep(5)
 
             if not context.user_data.get("workout_state"):
                 return
 
-            # Обновляем сообщение каждые 5 секунд чтобы не спамить Telegram
-            if remaining % 5 == 0:
-                mins = remaining // 60
-                secs = remaining % 60
-                try:
-                    await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=msg_id,
-                        text=(
-                            f"✅ Подход {idx + 1} выполнен: *{done_reps}* повторений\n\n"
-                            f"⏱ Отдых *{mins:02d}:{secs:02d}*"
-                        ),
-                        parse_mode="Markdown",
-                        reply_markup=skip_keyboard(),
-                    )
-                except Exception:
-                    pass
+            mins = remaining // 60
+            secs = remaining % 60
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=(
+                        f"✅ Подход {idx + 1} выполнен: *{done_reps}* повторений\n\n"
+                        f"⏱ Отдых *{mins:02d}:{secs:02d}*"
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
 
         if not context.user_data.get("workout_state"):
             return
 
-        # Убираем кнопку и показываем следующий подход
         await bot.edit_message_text(
             chat_id=chat_id,
             message_id=msg_id,
