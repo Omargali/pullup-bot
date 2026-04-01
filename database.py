@@ -19,18 +19,20 @@ async def init_db():
                 cycle_day       INTEGER NOT NULL DEFAULT 1,
                 is_rest_day     INTEGER NOT NULL DEFAULT 0,
                 total_workouts  INTEGER NOT NULL DEFAULT 0,
+                cycle_number    INTEGER NOT NULL DEFAULT 1,
                 created_at      TEXT DEFAULT (datetime('now'))
             )
         """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS workout_log (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id     INTEGER NOT NULL,
-                cycle_day   INTEGER NOT NULL,
-                planned     TEXT NOT NULL,
-                actual      TEXT,
-                completed   INTEGER DEFAULT 0,
-                logged_at   TEXT DEFAULT (datetime('now')),
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      INTEGER NOT NULL,
+                cycle_day    INTEGER NOT NULL,
+                cycle_number INTEGER NOT NULL DEFAULT 1,
+                planned      TEXT NOT NULL,
+                actual       TEXT,
+                completed    INTEGER DEFAULT 0,
+                logged_at    TEXT DEFAULT (datetime('now')),
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
         """)
@@ -43,6 +45,15 @@ async def init_db():
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
         """)
+        # Миграция: добавить cycle_number если старая БД без него
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN cycle_number INTEGER NOT NULL DEFAULT 1")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE workout_log ADD COLUMN cycle_number INTEGER NOT NULL DEFAULT 1")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -68,12 +79,14 @@ async def create_user(user_id: int, username: str, current_max: int):
 
 
 async def update_max(user_id: int, new_max: int):
-    """Обновляет максимум и сбрасывает цикл."""
+    """Обновляет максимум, сбрасывает цикл и увеличивает cycle_number."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET current_max = ?, cycle_day = 1, is_rest_day = 0 WHERE user_id = ?",
-            (new_max, user_id),
-        )
+        await db.execute("""
+            UPDATE users
+            SET current_max = ?, cycle_day = 1, is_rest_day = 0,
+                cycle_number = cycle_number + 1
+            WHERE user_id = ?
+        """, (new_max, user_id))
         await db.execute(
             "INSERT INTO max_history (user_id, max_reps) VALUES (?, ?)",
             (user_id, new_max),
@@ -82,12 +95,14 @@ async def update_max(user_id: int, new_max: int):
 
 
 async def reset_cycle(user_id: int):
-    """Сбрасывает только цикл, максимум остаётся."""
+    """Сбрасывает только цикл, максимум остаётся, cycle_number растёт."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET cycle_day = 1, is_rest_day = 0 WHERE user_id = ?",
-            (user_id,),
-        )
+        await db.execute("""
+            UPDATE users
+            SET cycle_day = 1, is_rest_day = 0,
+                cycle_number = cycle_number + 1
+            WHERE user_id = ?
+        """, (user_id,))
         await db.commit()
 
 
@@ -113,27 +128,32 @@ async def advance_day(user_id: int):
 
 
 async def log_workout(user_id: int, cycle_day: int, planned: str, actual: str, completed: bool):
+    user = await get_user(user_id)
+    cycle_number = user["cycle_number"] if user else 1
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO workout_log (user_id, cycle_day, planned, actual, completed) VALUES (?, ?, ?, ?, ?)",
-            (user_id, cycle_day, planned, actual, int(completed)),
+            """INSERT INTO workout_log
+               (user_id, cycle_day, cycle_number, planned, actual, completed)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (user_id, cycle_day, cycle_number, planned, actual, int(completed)),
         )
         await db.commit()
 
 
 async def get_completed_days_this_cycle(user_id: int) -> list:
-    """Возвращает список выполненных дней в текущем цикле (1, 2, 3)."""
+    """Возвращает список выполненных дней ТЕКУЩЕГО цикла."""
+    user = await get_user(user_id)
+    if not user:
+        return []
+    cycle_number = user["cycle_number"]
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        # Берём последние записи — дни текущего цикла
-        # Цикл сбрасывается при update_max/reset_cycle, поэтому берём записи после последнего сброса
         async with db.execute("""
             SELECT cycle_day FROM workout_log
-            WHERE user_id = ? AND cycle_day IN (1, 2, 3) AND completed = 1
-            ORDER BY logged_at DESC LIMIT 3
-        """, (user_id,)) as cursor:
+            WHERE user_id = ? AND cycle_number = ? AND cycle_day IN (1, 2, 3)
+        """, (user_id, cycle_number)) as cursor:
             rows = await cursor.fetchall()
-        return [r["cycle_day"] for r in rows]
+    return [r["cycle_day"] for r in rows]
 
 
 async def get_stats(user_id: int) -> dict:

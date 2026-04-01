@@ -14,8 +14,6 @@ from database import (
 from programs import generate_cycle, format_cycle_plan, calculate_progress, get_motivation
 
 
-# ──────────────────────── Главная клавиатура ──────────────────
-
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("💪 Тренировка"), KeyboardButton("📋 План")],
@@ -61,7 +59,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Изменить максимум", callback_data="settings_setmax")],
-        [InlineKeyboardButton("🔄 Сбросить цикл", callback_data="settings_reset")],
+        [InlineKeyboardButton("🔄 Сбросить цикл",     callback_data="settings_reset")],
     ])
 
     await update.message.reply_text(
@@ -92,7 +90,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_settings(update, context)
         return
 
-    # Ввод начального максимума
     if context.user_data.get("waiting_for_max"):
         if not text.isdigit() or int(text) < 1:
             await update.message.reply_text("❗ Введи число больше 0, например: `6`", parse_mode="Markdown")
@@ -112,7 +109,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Ввод нового максимума вручную через /setmax
     if context.user_data.get("waiting_for_setmax"):
         if not text.isdigit() or int(text) < 1:
             await update.message.reply_text("❗ Введи число больше 0", parse_mode="Markdown")
@@ -120,6 +116,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_max = int(text)
         old_max = context.user_data.pop("old_max_setmax", 0)
         context.user_data.pop("waiting_for_setmax", None)
+        context.user_data.pop("workout_state", None)  # сбрасываем активную тренировку
         await update_max(user_id, new_max)
         workouts = generate_cycle(new_max)
         diff = new_max - old_max
@@ -133,7 +130,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Ввод результата теста максимума
     if context.user_data.get("waiting_for_test"):
         if not text.isdigit() or int(text) < 1:
             await update.message.reply_text("❗ Введи число больше 0", parse_mode="Markdown")
@@ -170,16 +166,16 @@ async def show_set(update_or_query, context: ContextTypes.DEFAULT_TYPE, edit: bo
     sets = state["sets"]
     actual = state["actual"]
     total_sets = len(sets)
-    planned_reps = sets[idx]
 
     while len(actual) <= idx:
         actual.append(sets[idx])
+
     current_reps = actual[idx]
     done_so_far = sum(actual[:idx])
 
     text = (
         f"💪 *Подход {idx + 1} из {total_sets}*\n\n"
-        f"По плану: *{planned_reps}*\n\n"
+        f"По плану: *{sets[idx]}*\n\n"
         f"Сколько сделал?\n\n"
         f"*{current_reps}*\n\n"
         f"Уже выполнено: *{done_so_far}* подтягиваний"
@@ -208,6 +204,15 @@ async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not user:
         await update.message.reply_text("Сначала запусти /start и введи максимум.")
+        return
+
+    # БАГ 1 ИСПРАВЛЕН: защита от повторного запуска тренировки
+    if context.user_data.get("workout_state"):
+        await update.message.reply_text(
+            "⚠️ Тренировка уже идёт!\n\n"
+            "Заверши текущий подход или нажми /cancel чтобы отменить тренировку.",
+            parse_mode="Markdown",
+        )
         return
 
     if user["is_rest_day"]:
@@ -245,6 +250,7 @@ async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "set_index": 0,
         "rest_seconds": workout.rest_seconds,
         "planned_json": json.dumps(workout.sets),
+        "processing": False,  # БАГ 3: флаг защиты от двойного нажатия
     }
 
     day_label = {1: "🟢 Лёгкий", 2: "🟡 Средний", 3: "🔴 Тяжёлый"}.get(cycle_day, "")
@@ -258,6 +264,20 @@ async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=MAIN_KEYBOARD,
     )
     await show_set(update, context)
+
+
+# ─────────────────────────── /cancel ──────────────────────────
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("workout_state"):
+        context.user_data.pop("workout_state", None)
+        await update.message.reply_text(
+            "❌ Тренировка отменена.\n\nНажми *💪 Тренировка* когда будешь готов.",
+            parse_mode="Markdown",
+            reply_markup=MAIN_KEYBOARD,
+        )
+    else:
+        await update.message.reply_text("Нет активной тренировки.", reply_markup=MAIN_KEYBOARD)
 
 
 # ───────────────────── Колбэки ────────────────────────────────
@@ -285,7 +305,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("✅ Да, сбросить", callback_data="settings_reset_confirm"),
-                InlineKeyboardButton("❌ Отмена", callback_data="settings_reset_cancel"),
+                InlineKeyboardButton("❌ Отмена",       callback_data="settings_reset_cancel"),
             ]
         ])
         await query.edit_message_text(
@@ -298,10 +318,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "settings_reset_confirm":
+        context.user_data.pop("workout_state", None)  # отменяем активную тренировку
         await reset_cycle(user_id)
         await query.edit_message_text(
-            "✅ *Цикл сброшен!*\n\n"
-            "Начинаем с Дня 1. Нажми *💪 Тренировка*.",
+            "✅ *Цикл сброшен!*\n\nНачинаем с Дня 1. Нажми *💪 Тренировка*.",
             parse_mode="Markdown",
         )
         return
@@ -334,6 +354,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❗ Начни тренировку через 💪 Тренировка")
             return
 
+        # БАГ 3 ИСПРАВЛЕН: защита от двойного нажатия
+        if state.get("processing"):
+            return
+        state["processing"] = True
+
         idx = state["set_index"]
         sets = state["sets"]
         total_sets = len(sets)
@@ -343,6 +368,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         done_reps = state["actual"][idx]
 
+        # Последний подход
         if idx + 1 >= total_sets:
             actual_list = state["actual"]
             actual_json = json.dumps(actual_list)
@@ -357,7 +383,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("workout_state", None)
 
             sets_str = "  ".join(str(r) for r in actual_list)
-            next_msg = "Следующий шаг — отдых, затем *Тест максимума* 🏆" if cycle_day == 3 else f"Следующий шаг — отдых, затем *День {cycle_day + 1}*"
+            next_msg = (
+                "Следующий шаг — отдых, затем *Тест максимума* 🏆"
+                if cycle_day == 3
+                else f"Следующий шаг — отдых, затем *День {cycle_day + 1}*"
+            )
             status = "✅ Выполнено!" if completed else "💪 Сделал что смог!"
 
             await query.edit_message_text(
@@ -372,6 +402,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Таймер отдыха
         rest = state["rest_seconds"]
         state["set_index"] = idx + 1
+        state["processing"] = False  # сбрасываем флаг для следующего подхода
         while len(state["actual"]) <= idx + 1:
             state["actual"].append(sets[idx + 1])
 
@@ -445,28 +476,22 @@ async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"📋 *План цикла* (макс: {user['current_max']})\n"]
     for w in workouts:
         sets_str = "  ".join(str(s) for s in w.sets)
-        mins = w.rest_seconds // 60
-        secs = w.rest_seconds % 60
-        rest_str = f"{mins:02d}:{secs:02d}"
+        rest_str = f"{w.rest_seconds // 60:02d}:{w.rest_seconds % 60:02d}"
 
         if w.day in completed_days:
             status = "✅"
         elif w.day == current_day and not user["is_rest_day"]:
             status = "▶️"
         else:
-            status = "⬜"
+            status = "❌"
 
         lines.append(f"{status} День {w.day}: `{sets_str}` — отдых {rest_str}")
 
-    # Тест
     if current_day == 4 and not user["is_rest_day"]:
         test_status = "▶️"
-    elif len(completed_days) == 3:
-        test_status = "⬜"
     else:
-        test_status = "⬜"
+        test_status = "❌"
     lines.append(f"{test_status} Тест максимума 🏆")
-
     lines.append("\n_После дня 3 → день отдыха → Тест максимума_")
 
     await update.message.reply_text(
@@ -530,8 +555,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 *План* — план цикла с галочками\n"
         "📊 *Прогресс* — статистика\n"
         "⚙️ *Настройки* — изменить максимум / сбросить цикл\n\n"
-        "/start — перезапуск\n"
-        "/setmax — быстро изменить максимум",
+        "/cancel — отменить текущую тренировку\n"
+        "/setmax — быстро изменить максимум\n"
+        "/start — перезапуск",
         parse_mode="Markdown",
         reply_markup=MAIN_KEYBOARD,
     )
