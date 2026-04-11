@@ -218,42 +218,52 @@ async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cycle_day = user["cycle_day"]
 
     if cycle_day == 4:
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Да, начать тест", callback_data="confirm_workout"),
+                InlineKeyboardButton("❌ Отмена", callback_data="confirm_cancel"),
+            ]
+        ])
         context.user_data["waiting_for_test"] = True
         context.user_data["old_max"] = user["current_max"]
         await update.message.reply_text(
             "🏆 *День теста максимума!*\n\n"
             f"Предыдущий максимум: *{user['current_max']}*\n\n"
-            "Сделай максимальное количество подтягиваний за один подход — до отказа.\n\n"
-            "Введи результат:",
+            "Начать тест?",
             parse_mode="Markdown",
-            reply_markup=MAIN_KEYBOARD,
+            reply_markup=keyboard,
         )
         return
 
     workouts = generate_cycle(user["current_max"])
     workout = workouts[cycle_day - 1]
+    day_label = {1: "🟢 Лёгкий", 2: "🟡 Средний", 3: "🔴 Тяжёлый"}.get(cycle_day, "")
 
-    context.user_data["workout_state"] = {
+    context.user_data["pending_workout"] = {
         "cycle_day": cycle_day,
         "sets": workout.sets,
         "actual": [workout.sets[0]],
         "set_index": 0,
         "rest_seconds": workout.rest_seconds,
         "planned_json": json.dumps(workout.sets),
-        "processing": False,  # БАГ 3: флаг защиты от двойного нажатия
+        "processing": False,
     }
 
-    day_label = {1: "🟢 Лёгкий", 2: "🟡 Средний", 3: "🔴 Тяжёлый"}.get(cycle_day, "")
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Да, начать", callback_data="confirm_workout"),
+            InlineKeyboardButton("❌ Отмена", callback_data="confirm_cancel"),
+        ]
+    ])
+
     await update.message.reply_text(
         f"*День {cycle_day} из 3 — {day_label}*\n\n"
-        f"План: `{'  '.join(str(s) for s in workout.sets)}`\n"
-        f"Итого: *{workout.total}* подтягиваний\n"
-        f"Отдых: *{workout.rest_seconds // 60:02d}:{workout.rest_seconds % 60:02d}*\n\n"
-        f"Начинаем! 👇",
+        f"Plan: `{'  '.join(str(s) for s in workout.sets)}`\n"
+        f"Итого: *{workout.total}* подтягиваний\n\n"
+        f"Начать тренировку?",
         parse_mode="Markdown",
-        reply_markup=MAIN_KEYBOARD,
+        reply_markup=keyboard,
     )
-    await show_set(update, context)
 
 
 # ─────────────────────────── /cancel ──────────────────────────
@@ -318,6 +328,42 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "settings_reset_cancel":
         await query.edit_message_text("Отмена. Ничего не изменилось.")
+        return
+
+    # ── Подтверждение тренировки ──
+    if data == "confirm_workout":
+        pending = context.user_data.pop("pending_workout", None)
+        if pending:
+            # Обычная тренировка
+            context.user_data["workout_state"] = pending
+            cycle_day = pending["cycle_day"]
+            sets = pending["sets"]
+            rest = pending["rest_seconds"]
+            day_label = {1: "🟢 Лёгкий", 2: "🟡 Средний", 3: "🔴 Тяжёлый"}.get(cycle_day, "")
+            await query.edit_message_text(
+                f"*День {cycle_day} из 3 — {day_label}*\n\n"
+                f"План: `{'  '.join(str(s) for s in sets)}`\n"
+                f"Итого: *{sum(sets)}* подтягиваний\n"
+                f"Отдых: *{rest // 60:02d}:{rest % 60:02d}*\n\n"
+                f"Начинаем! 👇",
+                parse_mode="Markdown",
+            )
+            await show_set_by_chat(context.bot, query.message.chat_id, context, 0, sets, len(sets))
+        else:
+            # Тест максимума — просто показываем инструкцию
+            await query.edit_message_text(
+                "🏆 *Тест максимума!*\n\n"
+                "Сделай максимальное количество подтягиваний за один подход — до отказа.\n\n"
+                "Введи результат:",
+                parse_mode="Markdown",
+            )
+        return
+
+    if data == "confirm_cancel":
+        context.user_data.pop("pending_workout", None)
+        context.user_data.pop("waiting_for_test", None)
+        context.user_data.pop("old_max", None)
+        await query.edit_message_text("❌ Отменено.")
         return
 
     # ── Подходы ──
