@@ -215,16 +215,6 @@ async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if user["is_rest_day"]:
-        await update.message.reply_text(
-            "😴 *Сегодня день отдыха.*\n\n"
-            "Мышцы растут именно сейчас 💪\n"
-            "Завтра — следующая тренировка.",
-            parse_mode="Markdown",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-
     cycle_day = user["cycle_day"]
 
     if cycle_day == 4:

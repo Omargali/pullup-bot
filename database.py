@@ -111,19 +111,12 @@ async def advance_day(user_id: int):
     if not user:
         return
     cycle_day = user["cycle_day"]
-    is_rest = user["is_rest_day"]
+    next_day = cycle_day + 1 if cycle_day < 4 else 1
     async with aiosqlite.connect(DB_PATH) as db:
-        if is_rest:
-            next_day = cycle_day + 1 if cycle_day < 4 else 1
-            await db.execute(
-                "UPDATE users SET cycle_day = ?, is_rest_day = 0 WHERE user_id = ?",
-                (next_day, user_id),
-            )
-        else:
-            await db.execute(
-                "UPDATE users SET is_rest_day = 1, total_workouts = total_workouts + 1 WHERE user_id = ?",
-                (user_id,),
-            )
+        await db.execute(
+            "UPDATE users SET cycle_day = ?, is_rest_day = 0, total_workouts = total_workouts + 1 WHERE user_id = ?",
+            (next_day, user_id),
+        )
         await db.commit()
 
 
